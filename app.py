@@ -8,8 +8,8 @@ from io import BytesIO
 
 app = Flask(__name__)
 
-# Hard limit: reject requests over 4MB (base64 of a 3MB image = ~4MB)
-app.config['MAX_CONTENT_LENGTH'] = 4 * 1024 * 1024
+# Hard reject anything over 10MB request body
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024
 
 # ── Verhoeff tables ───────────────────────────────────────────
 D = [
@@ -45,29 +45,18 @@ def extract_aadhaar_numbers(text):
     return found
 
 def compress_image(image):
-    # Grayscale — halves RAM vs RGB, better OCR accuracy
+    # Step 1: Grayscale — cuts RAM by 3x vs RGB
     image = image.convert('L')
-    # Cap width
-    if image.width > 1000:
-        ratio = 1000 / image.width
-        image = image.resize((1000, int(image.height * ratio)), Image.LANCZOS)
-    # Cap height
-    if image.height > 1500:
-        ratio = 1500 / image.height
-        image = image.resize((int(image.width * ratio), 1500), Image.LANCZOS)
+    # Step 2: Aggressively cap size — 800px is enough for OCR on ID cards
+    image.thumbnail((800, 800), Image.LANCZOS)
     return image
 
 
-# ── 413 error handler ─────────────────────────────────────────
-from flask import abort
 from werkzeug.exceptions import RequestEntityTooLarge
 
 @app.errorhandler(RequestEntityTooLarge)
 def too_large(e):
-    return jsonify({
-        "error": "File too large. Please upload an image under 3MB.",
-        "match": False
-    }), 413
+    return jsonify({"error": "File too large.", "match": False}), 413
 
 
 @app.route('/', methods=['GET'])
@@ -92,48 +81,38 @@ def verify():
         if not aadhaar_number:
             return jsonify({"error": "aadhaar_number is required", "match": False}), 400
 
-        # Strip data URI prefix if present
+        # Strip data URI prefix
         if "," in image_base64:
             image_base64 = image_base64.split(",")[1]
-
-        # Check base64 length — 2MB image base64 = ~2.7MB string
-        if len(image_base64) > 3_500_000:
-            return jsonify({
-                "error": "Image too large. Please upload under 2MB.",
-                "match": False
-            }), 413
 
         # Decode base64
         try:
             image_bytes = base64.b64decode(image_base64)
         except Exception as e:
-            return jsonify({"error": "Invalid base64 data: " + str(e), "match": False}), 400
+            return jsonify({"error": "Invalid base64: " + str(e), "match": False}), 400
 
         # Open image
         try:
             image = Image.open(BytesIO(image_bytes))
-            image.load()  # Force load into memory now to catch corrupt files
+            image.load()
         except Exception as e:
             return jsonify({"error": "Cannot open image: " + str(e), "match": False}), 400
 
-        # Free raw bytes immediately to save RAM
+        # Free raw bytes immediately
         del image_bytes
+        image_base64 = None
 
-        # Compress before OCR
+        # Compress aggressively
         image = compress_image(image)
 
-        # Run Tesseract
+        # OCR pass 1
         raw_text = pytesseract.image_to_string(image, config='--oem 3 --psm 6')
 
-        # Free image from RAM
-        del image
-
-        # Retry with psm 11 if nothing found
+        # OCR pass 2 if nothing found
         if raw_text.strip() == "":
-            raw_text = pytesseract.image_to_string(
-                compress_image(Image.open(BytesIO(base64.b64decode(image_base64)))),
-                config='--oem 3 --psm 11'
-            )
+            raw_text = pytesseract.image_to_string(image, config='--oem 3 --psm 11')
+
+        del image
 
         numbers_found = extract_aadhaar_numbers(raw_text)
         match         = aadhaar_number in numbers_found
@@ -146,10 +125,7 @@ def verify():
         })
 
     except MemoryError:
-        return jsonify({
-            "error": "Image too large for server memory. Upload a smaller image.",
-            "match": False
-        }), 413
+        return jsonify({"error": "Image too large.", "match": False}), 500
 
     except Exception as e:
         return jsonify({"error": "Server error: " + str(e), "match": False}), 500
