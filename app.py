@@ -52,6 +52,19 @@ def extract_aadhaar_numbers(text):
             found.append(candidate)
     return found
 
+def compress_image(image):
+    # Grayscale halves RAM vs RGB and improves OCR
+    image = image.convert('L')
+    # Cap width at 1200px
+    if image.width > 1200:
+        ratio = 1200 / image.width
+        image = image.resize((1200, int(image.height * ratio)), Image.LANCZOS)
+    # Cap height at 1800px
+    if image.height > 1800:
+        ratio = 1800 / image.height
+        image = image.resize((int(image.width * ratio), 1800), Image.LANCZOS)
+    return image
+
 
 @app.route('/', methods=['GET'])
 def health():
@@ -61,7 +74,7 @@ def health():
 @app.route('/verify', methods=['POST'])
 def verify():
     try:
-        data = request.get_json()
+        data = request.get_json(force=True, silent=True)
 
         if not data:
             return jsonify({"error": "No JSON body received"}), 400
@@ -75,31 +88,39 @@ def verify():
         if not aadhaar_number:
             return jsonify({"error": "aadhaar_number is required"}), 400
 
-        # Decode base64 image
+        # Strip data URI prefix if present e.g. "data:image/png;base64,..."
+        if "," in image_base64:
+            image_base64 = image_base64.split(",")[1]
+
+        # Decode base64
         try:
             image_bytes = base64.b64decode(image_base64)
             image       = Image.open(BytesIO(image_bytes))
         except Exception as e:
-            return jsonify({"error": "Invalid image: " + str(e)}), 400
+            return jsonify({"error": "Invalid image data: " + str(e)}), 400
 
-        # Convert to RGB
-        if image.mode not in ('RGB', 'L'):
-            image = image.convert('RGB')
+        # Compress — resize + grayscale before OCR
+        image = compress_image(image)
 
-        # Run Tesseract
+        # Run Tesseract — psm 6 for uniform text blocks
         raw_text = pytesseract.image_to_string(image, config='--oem 3 --psm 6')
 
-        # Extract Aadhaar numbers
-        numbers_found = extract_aadhaar_numbers(raw_text)
+        # Retry with psm 11 (sparse text) if nothing found
+        if raw_text.strip() == "":
+            raw_text = pytesseract.image_to_string(image, config='--oem 3 --psm 11')
 
-        match = aadhaar_number in numbers_found
+        numbers_found = extract_aadhaar_numbers(raw_text)
+        match         = aadhaar_number in numbers_found
 
         return jsonify({
             "match":         match,
             "numbers_found": numbers_found,
             "entered":       aadhaar_number,
-            "message":       "Match found" if match else "Number not found on card"
+            "message":       "Match found" if match else "Aadhaar number mismatching."
         })
+
+    except MemoryError:
+        return jsonify({"error": "Image too large. Please upload a smaller file."}), 413
 
     except Exception as e:
         return jsonify({"error": "Server error: " + str(e)}), 500
