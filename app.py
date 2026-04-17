@@ -8,28 +8,20 @@ from io import BytesIO
 
 app = Flask(__name__)
 
+# Hard limit: reject requests over 4MB (base64 of a 3MB image = ~4MB)
+app.config['MAX_CONTENT_LENGTH'] = 4 * 1024 * 1024
+
 # ── Verhoeff tables ───────────────────────────────────────────
 D = [
-    [0,1,2,3,4,5,6,7,8,9],
-    [1,2,3,4,0,6,7,8,9,5],
-    [2,3,4,0,1,7,8,9,5,6],
-    [3,4,0,1,2,8,9,5,6,7],
-    [4,0,1,2,3,9,5,6,7,8],
-    [5,9,8,7,6,0,4,3,2,1],
-    [6,5,9,8,7,1,0,4,3,2],
-    [7,6,5,9,8,2,1,0,4,3],
-    [8,7,6,5,9,3,2,1,0,4],
+    [0,1,2,3,4,5,6,7,8,9],[1,2,3,4,0,6,7,8,9,5],[2,3,4,0,1,7,8,9,5,6],
+    [3,4,0,1,2,8,9,5,6,7],[4,0,1,2,3,9,5,6,7,8],[5,9,8,7,6,0,4,3,2,1],
+    [6,5,9,8,7,1,0,4,3,2],[7,6,5,9,8,2,1,0,4,3],[8,7,6,5,9,3,2,1,0,4],
     [9,8,7,6,5,4,3,2,1,0],
 ]
 P = [
-    [0,1,2,3,4,5,6,7,8,9],
-    [1,5,7,6,2,8,3,0,9,4],
-    [5,8,0,3,7,9,6,1,4,2],
-    [8,9,1,6,0,4,3,5,2,7],
-    [9,4,5,3,1,2,6,8,7,0],
-    [4,2,8,6,5,7,3,9,0,1],
-    [2,7,9,3,8,0,6,4,1,5],
-    [7,0,4,6,9,1,3,2,5,8],
+    [0,1,2,3,4,5,6,7,8,9],[1,5,7,6,2,8,3,0,9,4],[5,8,0,3,7,9,6,1,4,2],
+    [8,9,1,6,0,4,3,5,2,7],[9,4,5,3,1,2,6,8,7,0],[4,2,8,6,5,7,3,9,0,1],
+    [2,7,9,3,8,0,6,4,1,5],[7,0,4,6,9,1,3,2,5,8],
 ]
 
 def verhoeff_validate(number):
@@ -53,17 +45,29 @@ def extract_aadhaar_numbers(text):
     return found
 
 def compress_image(image):
-    # Grayscale halves RAM vs RGB and improves OCR
+    # Grayscale — halves RAM vs RGB, better OCR accuracy
     image = image.convert('L')
-    # Cap width at 1200px
-    if image.width > 1200:
-        ratio = 1200 / image.width
-        image = image.resize((1200, int(image.height * ratio)), Image.LANCZOS)
-    # Cap height at 1800px
-    if image.height > 1800:
-        ratio = 1800 / image.height
-        image = image.resize((int(image.width * ratio), 1800), Image.LANCZOS)
+    # Cap width
+    if image.width > 1000:
+        ratio = 1000 / image.width
+        image = image.resize((1000, int(image.height * ratio)), Image.LANCZOS)
+    # Cap height
+    if image.height > 1500:
+        ratio = 1500 / image.height
+        image = image.resize((int(image.width * ratio), 1500), Image.LANCZOS)
     return image
+
+
+# ── 413 error handler ─────────────────────────────────────────
+from flask import abort
+from werkzeug.exceptions import RequestEntityTooLarge
+
+@app.errorhandler(RequestEntityTooLarge)
+def too_large(e):
+    return jsonify({
+        "error": "File too large. Please upload an image under 3MB.",
+        "match": False
+    }), 413
 
 
 @app.route('/', methods=['GET'])
@@ -77,37 +81,59 @@ def verify():
         data = request.get_json(force=True, silent=True)
 
         if not data:
-            return jsonify({"error": "No JSON body received"}), 400
+            return jsonify({"error": "No JSON body received", "match": False}), 400
 
         image_base64   = data.get("image_base64", "")
         aadhaar_number = data.get("aadhaar_number", "").replace(" ", "").replace("-", "")
 
         if not image_base64:
-            return jsonify({"error": "image_base64 is required"}), 400
+            return jsonify({"error": "image_base64 is required", "match": False}), 400
 
         if not aadhaar_number:
-            return jsonify({"error": "aadhaar_number is required"}), 400
+            return jsonify({"error": "aadhaar_number is required", "match": False}), 400
 
-        # Strip data URI prefix if present e.g. "data:image/png;base64,..."
+        # Strip data URI prefix if present
         if "," in image_base64:
             image_base64 = image_base64.split(",")[1]
+
+        # Check base64 length — 2MB image base64 = ~2.7MB string
+        if len(image_base64) > 3_500_000:
+            return jsonify({
+                "error": "Image too large. Please upload under 2MB.",
+                "match": False
+            }), 413
 
         # Decode base64
         try:
             image_bytes = base64.b64decode(image_base64)
-            image       = Image.open(BytesIO(image_bytes))
         except Exception as e:
-            return jsonify({"error": "Invalid image data: " + str(e)}), 400
+            return jsonify({"error": "Invalid base64 data: " + str(e), "match": False}), 400
 
-        # Compress — resize + grayscale before OCR
+        # Open image
+        try:
+            image = Image.open(BytesIO(image_bytes))
+            image.load()  # Force load into memory now to catch corrupt files
+        except Exception as e:
+            return jsonify({"error": "Cannot open image: " + str(e), "match": False}), 400
+
+        # Free raw bytes immediately to save RAM
+        del image_bytes
+
+        # Compress before OCR
         image = compress_image(image)
 
-        # Run Tesseract — psm 6 for uniform text blocks
+        # Run Tesseract
         raw_text = pytesseract.image_to_string(image, config='--oem 3 --psm 6')
 
-        # Retry with psm 11 (sparse text) if nothing found
+        # Free image from RAM
+        del image
+
+        # Retry with psm 11 if nothing found
         if raw_text.strip() == "":
-            raw_text = pytesseract.image_to_string(image, config='--oem 3 --psm 11')
+            raw_text = pytesseract.image_to_string(
+                compress_image(Image.open(BytesIO(base64.b64decode(image_base64)))),
+                config='--oem 3 --psm 11'
+            )
 
         numbers_found = extract_aadhaar_numbers(raw_text)
         match         = aadhaar_number in numbers_found
@@ -116,14 +142,17 @@ def verify():
             "match":         match,
             "numbers_found": numbers_found,
             "entered":       aadhaar_number,
-            "message":       "Match found" if match else "Aadhaar number mismatching."
+            "message":       "Match found" if match else "Number not found on card"
         })
 
     except MemoryError:
-        return jsonify({"error": "Image too large. Please upload a smaller file."}), 413
+        return jsonify({
+            "error": "Image too large for server memory. Upload a smaller image.",
+            "match": False
+        }), 413
 
     except Exception as e:
-        return jsonify({"error": "Server error: " + str(e)}), 500
+        return jsonify({"error": "Server error: " + str(e), "match": False}), 500
 
 
 if __name__ == '__main__':
